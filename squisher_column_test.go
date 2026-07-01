@@ -1,0 +1,111 @@
+//go:build withblob
+
+package squisher
+
+import (
+	"crypto/aes"
+	"encoding/hex"
+	"testing"
+)
+
+// TestOutEncColumnDecomposition checks if OutEnc decomposes into
+// 4 independent 4-byte column functions (AES MixColumns structure).
+//
+// Standard AES operates on 4 columns of 4 bytes each.
+// Chow WB-AES typically preserves this column structure in its encodings.
+// If OutEnc(x) decomposes as:
+//   OutEnc(x) = [f0(x[0:4]), f1(x[4:8]), f2(x[8:12]), f3(x[12:16])]
+// then each fi is only 32-bit → 32-bit, which is far more tractable.
+func TestOutEncColumnDecomposition(t *testing.T) {
+	t.Log("=== Testing if OutEnc decomposes into 4-byte column functions ===")
+
+	keyHex := "c251c048e6a027945e178067df8ae466"
+	key, _ := hex.DecodeString(keyHex)
+	cipher, _ := aes.NewCipher(key)
+
+	// Helper: query OutEnc for block 1 with a given target ciphertext
+	queryOutEnc := func(targetCT [16]byte) [16]byte {
+		var pt [16]byte
+		cipher.Decrypt(pt[:], targetCT[:])
+		var pay [128]byte
+		copy(pay[16:32], pt[:])
+		gp, _ := runPhase1CaptureGP(pay)
+		var result [16]byte
+		copy(result[:], gp[16:32])
+		return result
+	}
+
+	// Baseline: OutEnc(0)
+	var zeroCT [16]byte
+	encZero := queryOutEnc(zeroCT)
+	t.Logf("OutEnc(0) = %x", encZero)
+
+	// Test column independence: vary ONLY column 0 (bytes 0-3),
+	// check if ONLY output bytes 0-3 change (or some other 4-byte group).
+	t.Log("\n--- Varying column 0 (CT bytes 0-3) only ---")
+
+	for trial := 0; trial < 8; trial++ {
+		var ct [16]byte
+		ct[trial%4] = byte(trial + 1) // only modify bytes 0-3
+
+		enc := queryOutEnc(ct)
+
+		// Which output bytes changed?
+		col0Changes := 0 // bytes 0-3
+		col1Changes := 0 // bytes 4-7
+		col2Changes := 0 // bytes 8-11
+		col3Changes := 0 // bytes 12-15
+
+		for j := 0; j < 4; j++ {
+			if enc[j] != encZero[j] { col0Changes++ }
+			if enc[4+j] != encZero[4+j] { col1Changes++ }
+			if enc[8+j] != encZero[8+j] { col2Changes++ }
+			if enc[12+j] != encZero[12+j] { col3Changes++ }
+		}
+
+		t.Logf("  Trial %d (CT byte %d = 0x%02x): col0=%d col1=%d col2=%d col3=%d changes",
+			trial, trial%4, trial+1, col0Changes, col1Changes, col2Changes, col3Changes)
+	}
+
+	// Test column 1: vary ONLY bytes 4-7
+	t.Log("\n--- Varying column 1 (CT bytes 4-7) only ---")
+	for trial := 0; trial < 8; trial++ {
+		var ct [16]byte
+		ct[4+trial%4] = byte(trial + 1) // only modify bytes 4-7
+
+		enc := queryOutEnc(ct)
+
+		col0Changes := 0
+		col1Changes := 0
+		col2Changes := 0
+		col3Changes := 0
+
+		for j := 0; j < 4; j++ {
+			if enc[j] != encZero[j] { col0Changes++ }
+			if enc[4+j] != encZero[4+j] { col1Changes++ }
+			if enc[8+j] != encZero[8+j] { col2Changes++ }
+			if enc[12+j] != encZero[12+j] { col3Changes++ }
+		}
+
+		t.Logf("  Trial %d (CT byte %d = 0x%02x): col0=%d col1=%d col2=%d col3=%d changes",
+			trial, 4+trial%4, trial+1, col0Changes, col1Changes, col2Changes, col3Changes)
+	}
+
+	// Also test: does the encoding preserve ANY grouping? Try 2-byte, 8-byte groups
+	t.Log("\n--- Testing arbitrary groupings: which output bytes change when input byte 0 changes? ---")
+	for inputByte := 0; inputByte < 16; inputByte++ {
+		var ct [16]byte
+		ct[inputByte] = 0x42
+
+		enc := queryOutEnc(ct)
+
+		changedBytes := []int{}
+		for j := 0; j < 16; j++ {
+			if enc[j] != encZero[j] {
+				changedBytes = append(changedBytes, j)
+			}
+		}
+
+		t.Logf("  CT byte %2d → %2d output bytes change (at: %v)", inputByte, len(changedBytes), changedBytes)
+	}
+}

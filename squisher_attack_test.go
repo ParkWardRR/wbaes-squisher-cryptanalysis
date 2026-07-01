@@ -1,0 +1,376 @@
+//go:build withblob
+
+package squisher
+
+import (
+	"crypto/aes"
+	"encoding/hex"
+	"fmt"
+	"testing"
+)
+
+// runFullPipeline executes the complete Phase 1 + Phase 2 pipeline
+// and returns the 20-byte hash output.
+func runFullPipeline(t *testing.T, payload [128]byte) [20]byte {
+	t.Helper()
+	return FPCleanExchange(payload)
+}
+
+// aesECB encrypts 128 bytes (8 blocks) using AES-128-ECB with the known key.
+func aesECB(payload [128]byte) [128]byte {
+	keyHex := "c251c048e6a027945e178067df8ae466"
+	key, _ := hex.DecodeString(keyHex)
+	block, _ := aes.NewCipher(key)
+
+	var ct [128]byte
+	for i := 0; i < 8; i++ {
+		block.Encrypt(ct[i*16:(i+1)*16], payload[i*16:(i+1)*16])
+	}
+	return ct
+}
+
+// TestSquisherExperiment1_InitialState discovers the initial state before
+// any blocks are processed. Runs multiple all-zero payloads to confirm
+// the output is deterministic.
+func TestSquisherExperiment1_InitialState(t *testing.T) {
+	var zero [128]byte
+	out1 := runFullPipeline(t, zero)
+	out2 := runFullPipeline(t, zero)
+
+	t.Logf("Phase 1 output (zeros): %x", out1)
+	t.Logf("Phase 1 output (zeros, run 2): %x", out2)
+
+	if out1 != out2 {
+		t.Fatal("Phase 1 is not deterministic!")
+	}
+	t.Log("✅ Phase 1 is deterministic (same output for same input)")
+
+	// Also compute standard AES-ECB on zeros for reference
+	ct := aesECB(zero)
+	t.Logf("Standard AES-ECB(zeros): %x", ct[:32])
+}
+
+// TestSquisherExperiment3_PostAESLinearity is THE critical test.
+// It checks whether the squisher (post-AES compression) is GF(2)-linear.
+//
+// If squisher(ct_A XOR ct_B) == squisher(ct_A) XOR squisher(ct_B),
+// then the ENTIRE 353K-instruction monster is just a binary matrix multiply.
+//
+// Previous tests failed because they tested through AES (which is non-linear).
+// This test factors AES out by varying the plaintext to produce known ciphertext
+// differences.
+func TestSquisherExperiment3_PostAESLinearity(t *testing.T) {
+	// Strategy: We can't directly feed arbitrary ciphertexts to the squisher
+	// (it's embedded in the WB-AES). But we CAN test linearity indirectly:
+	//
+	// Let f(pt) = squisher(AES(pt))   [the full Phase 1 function]
+	// Let g(ct) = squisher(ct)        [the squisher alone]
+	//
+	// If g is GF(2)-linear, then:
+	//   g(ct_A XOR ct_B) = g(ct_A) XOR g(ct_B)
+	//
+	// Equivalently:
+	//   f(pt_C) XOR f(zero) = f(pt_A) XOR f(pt_B) XOR f(zero)
+	//   where AES(pt_C) = AES(pt_A) XOR AES(pt_B)
+	//
+	// But we can't find pt_C easily because AES is a PRP.
+	// So instead, we test the FULL function for affine structure:
+	//
+	// Test: f(A) XOR f(B) XOR f(C) XOR f(A XOR B XOR C) == 0
+	// This holds IFF the function is affine (linear + constant).
+
+	t.Log("=== Experiment 3: Testing Full Pipeline for Affine Structure ===")
+
+	// Get f(0) as the base
+	var zero [128]byte
+	fZero := runFullPipeline(t, zero)
+	t.Logf("f(0) = %x", fZero)
+
+	// Test multiple random-ish inputs
+	passCount := 0
+	failCount := 0
+
+	for trial := 0; trial < 8; trial++ {
+		// Create two inputs that differ in specific bytes
+		var payA, payB [128]byte
+
+		// Input A: set byte `trial` to a nonzero value
+		payA[trial] = 0x01
+
+		// Input B: set byte `trial+8` to a nonzero value  
+		payB[trial+8] = 0x01
+
+		// Input C = A XOR B (both bytes set)
+		var payC [128]byte
+		for i := 0; i < 128; i++ {
+			payC[i] = payA[i] ^ payB[i]
+		}
+
+		fA := runFullPipeline(t, payA)
+		fB := runFullPipeline(t, payB)
+		fC := runFullPipeline(t, payC)
+
+		// Affine test: f(A) XOR f(B) XOR f(C) XOR f(0) should == 0
+		// if the function is affine
+		var check [20]byte
+		for i := 0; i < 20; i++ {
+			check[i] = fA[i] ^ fB[i] ^ fC[i] ^ fZero[i]
+		}
+
+		isZero := true
+		for _, b := range check {
+			if b != 0 {
+				isZero = false
+				break
+			}
+		}
+
+		if isZero {
+			passCount++
+			t.Logf("Trial %d: ✅ AFFINE (f(A)⊕f(B)⊕f(C)⊕f(0) = 0)", trial)
+		} else {
+			failCount++
+			t.Logf("Trial %d: ❌ NOT AFFINE (check = %x)", trial, check)
+		}
+
+		t.Logf("  f(A)=%x", fA)
+		t.Logf("  f(B)=%x", fB)
+		t.Logf("  f(C)=%x", fC)
+	}
+
+	t.Logf("\n=== Results: %d/8 affine, %d/8 non-affine ===", passCount, failCount)
+	if failCount == 0 {
+		t.Log("🎉🎉🎉 THE FULL PIPELINE IS AFFINE! The squisher is (at most) a matrix + constant!")
+	} else {
+		t.Log("Full pipeline is not affine — but the squisher ALONE might still be linear.")
+		t.Log("Next step: Experiment 4 — check if squisher operates on standard AES ciphertext.")
+	}
+}
+
+// TestSquisherExperiment4_AESAware checks whether the WB-AES internal state
+// that enters the squisher matches standard AES-ECB ciphertext.
+//
+// We compare the WB-AES output for known inputs against standard AES-ECB.
+// If they match, the squisher operates on standard ciphertext and we can
+// factor out AES entirely.
+func TestSquisherExperiment4_AESAware(t *testing.T) {
+	t.Log("=== Experiment 4: Does the squisher operate on standard AES ciphertext? ===")
+
+	// Run Phase 1 with zeros and capture ALL memory at the Phase 1/2 boundary
+	var zero [128]byte
+	buildCachedTrace()
+	loadEmbeddedSnapshot()
+
+	mem := make([]byte, fpCompiledMemSize)
+	copy(mem, cachedInitialMem)
+	copy(mem[addrToOff(fpPayloadVAddr):], zero[:])
+
+	xr := cachedInitialRegs
+	sp := cachedInitialSP
+	var vreg [32][2]uint64
+	var nz, zz, cz, vz bool
+	seenPages := make(map[uint64]bool)
+
+	for i := 0; i < fpSplitIndex && i < len(cachedTrace); i++ {
+		te := cachedTrace[i]
+		if te.inst == 0xFFFFFFFF && te.stubRegs != nil {
+			xr = *te.stubRegs
+			sp = te.stubSP
+			for addr, data := range te.stubNewPages {
+				if !seenPages[addr] {
+					off := addrToOff(addr)
+					copy(mem[off:off+len(data)], data)
+					seenPages[addr] = true
+				}
+			}
+			continue
+		}
+		if te.inst == 0xD4200000 {
+			continue
+		}
+		execCompiledInstr(mem, &xr, &sp, &vreg, &nz, &zz, &cz, &vz, te.inst, te.pc)
+	}
+
+	// Compute standard AES-ECB on the same input
+	stdCT := aesECB(zero)
+	t.Logf("Standard AES-ECB(zeros): %x", stdCT)
+
+	// Search the emulator memory for the standard ciphertext bytes
+	// This tells us if standard AES output appears ANYWHERE in the WB-AES state
+	t.Log("\nSearching emulator memory for standard AES ciphertext block 0...")
+	searchFor := stdCT[:16] // First 16-byte block
+	found := 0
+	for off := 0; off < len(mem)-16; off++ {
+		match := true
+		for j := 0; j < 16; j++ {
+			if mem[off+j] != searchFor[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			found++
+			t.Logf("  ✅ Found at memory offset %d (0x%x)", off, off)
+		}
+	}
+	if found == 0 {
+		t.Log("  ❌ Standard AES ciphertext NOT found in memory")
+		t.Log("  → The squisher operates on ENCODED state, not standard ciphertext")
+	} else {
+		t.Logf("  Found %d matches — standard AES ciphertext IS present in memory!", found)
+		t.Log("  → The squisher MAY operate on standard ciphertext")
+	}
+
+	// Also check: does the GP output (128 bytes used by Phase 2) contain
+	// the standard AES ciphertext?
+	t.Log("\nChecking GP output buffer (128 bytes at memory offset 16848)...")
+	gpOut := mem[16848 : 16848+128]
+	t.Logf("GP output: %x", gpOut)
+
+	matchCount := 0
+	for i := 0; i < 8; i++ {
+		blockMatch := true
+		for j := 0; j < 16; j++ {
+			if gpOut[i*16+j] != stdCT[i*16+j] {
+				blockMatch = false
+				break
+			}
+		}
+		if blockMatch {
+			matchCount++
+			t.Logf("  Block %d: ✅ MATCHES standard AES", i)
+		} else {
+			t.Logf("  Block %d: ❌ differs (GP=%x, AES=%x)", i,
+				gpOut[i*16:(i+1)*16], stdCT[i*16:(i+1)*16])
+		}
+	}
+
+	if matchCount == 8 {
+		t.Log("\n🎉🎉🎉 ALL 8 BLOCKS MATCH STANDARD AES! The squisher works on raw ciphertext!")
+	} else {
+		t.Logf("\n%d/8 blocks match. The WB-AES applies additional encoding to the ciphertext.", matchCount)
+	}
+}
+
+// TestSquisherExperiment5_SingleByteInfluence maps how each input byte
+// affects each output byte. This builds the influence matrix.
+func TestSquisherExperiment5_SingleByteInfluence(t *testing.T) {
+	t.Log("=== Experiment 5: Single-Byte Influence Matrix ===")
+
+	var zero [128]byte
+	fZero := runFullPipeline(t, zero)
+
+	// For each input byte position, flip it and see which output bytes change
+	influenceMatrix := make([][]bool, 20) // output_byte → affected_by_input_byte
+	for i := range influenceMatrix {
+		influenceMatrix[i] = make([]bool, 128)
+	}
+
+	changedOutputBytes := 0
+	for inputByte := 0; inputByte < 128; inputByte++ {
+		var pay [128]byte
+		pay[inputByte] = 0xFF
+
+		fDelta := runFullPipeline(t, pay)
+
+		affected := 0
+		for outByte := 0; outByte < 20; outByte++ {
+			if fDelta[outByte] != fZero[outByte] {
+				influenceMatrix[outByte][inputByte] = true
+				affected++
+			}
+		}
+		changedOutputBytes += affected
+
+		if inputByte < 16 || inputByte%16 == 0 {
+			t.Logf("Input byte %3d → %2d/20 output bytes change", inputByte, affected)
+		}
+	}
+
+	// Summarize: how many input bytes affect each output byte?
+	t.Log("\n=== Output Byte Dependency Count ===")
+	for outByte := 0; outByte < 20; outByte++ {
+		deps := 0
+		for _, b := range influenceMatrix[outByte] {
+			if b {
+				deps++
+			}
+		}
+		t.Logf("Output byte %2d: affected by %3d/128 input bytes", outByte, deps)
+	}
+
+	avgAffected := float64(changedOutputBytes) / 128.0
+	t.Logf("\nAverage output bytes changed per input byte flip: %.1f/20", avgAffected)
+
+	if avgAffected > 19.0 {
+		t.Log("Full avalanche — every input byte affects (nearly) every output byte")
+		t.Log("This is consistent with AES diffusion. The squisher may still be simple POST-AES.")
+	} else if avgAffected < 5.0 {
+		t.Log("🎉 Sparse influence! The squisher might decompose into independent sub-functions!")
+	}
+}
+
+// TestSquisherExperiment6_XORFold tests the simplest hypothesis:
+// output = AES_block_0 XOR AES_block_1 XOR ... XOR AES_block_7, truncated to 20 bytes.
+func TestSquisherExperiment6_XORFold(t *testing.T) {
+	t.Log("=== Experiment 6: Is the squisher just an XOR fold of AES blocks? ===")
+
+	testPayloads := [][128]byte{
+		{},                                                // all zeros
+		func() [128]byte { var p [128]byte; p[0] = 1; return p }(),   // single byte
+		func() [128]byte { var p [128]byte; for i := range p { p[i] = byte(i) }; return p }(), // sequential
+	}
+
+	for idx, pay := range testPayloads {
+		actual := runFullPipeline(t, pay)
+		ct := aesECB(pay)
+
+		// XOR all 8 ciphertext blocks together
+		var xorFold [16]byte
+		for block := 0; block < 8; block++ {
+			for j := 0; j < 16; j++ {
+				xorFold[j] ^= ct[block*16+j]
+			}
+		}
+
+		// Compare first 20 bytes (xorFold is only 16, so compare what we can)
+		match := true
+		for j := 0; j < 16 && j < 20; j++ {
+			if xorFold[j] != actual[j] {
+				match = false
+				break
+			}
+		}
+
+		status := "❌"
+		if match {
+			status = "✅"
+		}
+		t.Logf("Payload %d: %s XOR-fold=%x, actual=%x", idx, status, xorFold, actual)
+	}
+
+	t.Log("\nAlso testing: reversed XOR-fold (block 7 first)...")
+	pay := testPayloads[0]
+	actual := runFullPipeline(t, pay)
+	ct := aesECB(pay)
+
+	var revFold [16]byte
+	for block := 7; block >= 0; block-- {
+		for j := 0; j < 16; j++ {
+			revFold[j] ^= ct[block*16+j]
+		}
+	}
+	t.Logf("Reversed XOR-fold=%x, actual=%x", revFold, actual)
+
+	// Also try: concatenation of first bytes from each block
+	t.Log("\nAlso testing: first 2-3 bytes from each block concatenated...")
+	var concat20 [20]byte
+	for block := 0; block < 8 && block*3 < 20; block++ {
+		for j := 0; j < 3 && block*3+j < 20; j++ {
+			concat20[block*3+j] = ct[block*16+j]
+		}
+	}
+	t.Logf("Concat(first 3 per block)=%x, actual=%x", concat20, actual)
+
+	fmt.Println() // suppress unused import
+}

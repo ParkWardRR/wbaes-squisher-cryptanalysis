@@ -1,0 +1,285 @@
+//go:build withblob
+
+package squisher
+
+import (
+	"crypto/aes"
+	"encoding/binary"
+	"encoding/hex"
+	"math/bits"
+	"testing"
+)
+
+// TestDCAAttackOnPhase1 implements Differential Computation Analysis (DCA)
+// on the WB-AES Phase 1 output.
+//
+// DCA (Bos et al., 2016) treats the white-box as a side-channel target:
+// 1. Collect many (plaintext, intermediate_value) pairs
+// 2. For each key hypothesis k, predict what the S-box output would be
+// 3. Correlate the prediction with the actual intermediate values
+// 4. The correct key produces the highest correlation
+//
+// But we already KNOW the key (c251c048e6a027945e178067df8ae466).
+// So instead of key recovery, we use DCA-style analysis to:
+// 1. Verify the key is correct by checking S-box output correlation
+// 2. Identify WHERE in the GP buffer each S-box output appears
+// 3. Extract the output encoding by comparing predicted vs actual
+//
+// This is a completely different approach from the per-byte probing.
+func TestDCAAttackOnPhase1(t *testing.T) {
+	t.Log("=== DCA-Style Analysis of Phase 1 GP Output ===")
+	t.Log("Goal: Correlate standard AES S-box outputs with GP buffer bytes")
+	t.Log("      to find where each S-box output lands and what encoding it has")
+
+	keyHex := "c251c048e6a027945e178067df8ae466"
+	key, _ := hex.DecodeString(keyHex)
+	cipher, _ := aes.NewCipher(key)
+
+	// AES S-box (standard)
+	sbox := [256]byte{
+		0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
+		0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0, 0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0,
+		0xb7, 0xfd, 0x93, 0x26, 0x36, 0x3f, 0xf7, 0xcc, 0x34, 0xa5, 0xe5, 0xf1, 0x71, 0xd8, 0x31, 0x15,
+		0x04, 0xc7, 0x23, 0xc3, 0x18, 0x96, 0x05, 0x9a, 0x07, 0x12, 0x80, 0xe2, 0xeb, 0x27, 0xb2, 0x75,
+		0x09, 0x83, 0x2c, 0x1a, 0x1b, 0x6e, 0x5a, 0xa0, 0x52, 0x3b, 0xd6, 0xb3, 0x29, 0xe3, 0x2f, 0x84,
+		0x53, 0xd1, 0x00, 0xed, 0x20, 0xfc, 0xb1, 0x5b, 0x6a, 0xcb, 0xbe, 0x39, 0x4a, 0x4c, 0x58, 0xcf,
+		0xd0, 0xef, 0xaa, 0xfb, 0x43, 0x4d, 0x33, 0x85, 0x45, 0xf9, 0x02, 0x7f, 0x50, 0x3c, 0x9f, 0xa8,
+		0x51, 0xa3, 0x40, 0x8f, 0x92, 0x9d, 0x38, 0xf5, 0xbc, 0xb6, 0xda, 0x21, 0x10, 0xff, 0xf3, 0xd2,
+		0xcd, 0x0c, 0x13, 0xec, 0x5f, 0x97, 0x44, 0x17, 0xc4, 0xa7, 0x7e, 0x3d, 0x64, 0x5d, 0x19, 0x73,
+		0x60, 0x81, 0x4f, 0xdc, 0x22, 0x2a, 0x90, 0x88, 0x46, 0xee, 0xb8, 0x14, 0xde, 0x5e, 0x0b, 0xdb,
+		0xe0, 0x32, 0x3a, 0x0a, 0x49, 0x06, 0x24, 0x5c, 0xc2, 0xd3, 0xac, 0x62, 0x91, 0x95, 0xe4, 0x79,
+		0xe7, 0xc8, 0x37, 0x6d, 0x8d, 0xd5, 0x4e, 0xa9, 0x6c, 0x56, 0xf4, 0xea, 0x65, 0x7a, 0xae, 0x08,
+		0xba, 0x78, 0x25, 0x2e, 0x1c, 0xa6, 0xb4, 0xc6, 0xe8, 0xdd, 0x74, 0x1f, 0x4b, 0xbd, 0x8b, 0x8a,
+		0x70, 0x3e, 0xb5, 0x66, 0x48, 0x03, 0xf6, 0x0e, 0x61, 0x35, 0x57, 0xb9, 0x86, 0xc1, 0x1d, 0x9e,
+		0xe1, 0xf8, 0x98, 0x11, 0x69, 0xd9, 0x8e, 0x94, 0x9b, 0x1e, 0x87, 0xe9, 0xce, 0x55, 0x28, 0xdf,
+		0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16,
+	}
+
+	// Collect 256 samples: vary byte 0 of block 1 (payload[16])
+	const N = 256
+	type sample struct {
+		plainByte byte     // plaintext byte
+		sboxOut   byte     // predicted S-box output (round 1, byte 0)
+		gpOut     [128]byte // actual WB-AES GP output
+		stdCT     [128]byte // standard AES-ECB output
+	}
+
+	samples := make([]sample, N)
+	for v := 0; v < N; v++ {
+		var pay [128]byte
+		pay[16] = byte(v)
+
+		gp, _ := runPhase1CaptureGP(pay)
+
+		var stdCT [128]byte
+		cipher.Encrypt(stdCT[16:32], pay[16:32])
+
+		// Round 1 S-box output for byte 0: S(plaintext[0] XOR key[0])
+		// For block 1, the AES input is pay[16:32]
+		sboxIn := pay[16] ^ key[0]
+
+		samples[v] = sample{
+			plainByte: byte(v),
+			sboxOut:   sbox[sboxIn],
+			gpOut:     gp,
+			stdCT:     stdCT,
+		}
+	}
+
+	// DCA correlation: for each GP output byte, compute correlation with S-box output
+	// Use Hamming weight correlation (standard DCA approach)
+	t.Log("\n=== Correlation of S-box(PT[16] XOR key[0]) with each GP byte ===")
+	t.Log("    High |correlation| = the GP byte is related to S-box output")
+
+	for gpByte := 0; gpByte < 128; gpByte++ {
+		// Compute correlation between HW(S-box output) and each bit of GP byte
+		var sumSbox, sumGP, sumSboxGP, sumSbox2, sumGP2 float64
+
+		for _, s := range samples {
+			sboxHW := float64(bits.OnesCount8(s.sboxOut))
+			gpHW := float64(bits.OnesCount8(s.gpOut[gpByte]))
+
+			sumSbox += sboxHW
+			sumGP += gpHW
+			sumSboxGP += sboxHW * gpHW
+			sumSbox2 += sboxHW * sboxHW
+			sumGP2 += gpHW * gpHW
+		}
+
+		n := float64(N)
+		numerator := n*sumSboxGP - sumSbox*sumGP
+		denominator := (n*sumSbox2 - sumSbox*sumSbox) * (n*sumGP2 - sumGP*sumGP)
+
+		corr := 0.0
+		if denominator > 0 {
+			corr = numerator / sqrt(denominator)
+		}
+
+		if corr > 0.3 || corr < -0.3 {
+			t.Logf("  GP byte %3d: correlation = %.4f %s", gpByte, corr, "⚡ SIGNIFICANT")
+		}
+	}
+
+	// Also check: bit-level correlation (more sensitive)
+	t.Log("\n=== Bit-level correlation (S-box output bit i vs GP byte j bit k) ===")
+	t.Log("    Perfect correlation (±1.0) = the bit is directly exposed (possibly inverted)")
+
+	perfectCorrs := 0
+	for gpByte := 16; gpByte < 32; gpByte++ { // check block 1 only
+		for gpBit := 0; gpBit < 8; gpBit++ {
+			for sboxBit := 0; sboxBit < 8; sboxBit++ {
+				match := 0
+				for _, s := range samples {
+					sBit := (s.sboxOut >> sboxBit) & 1
+					gBit := (s.gpOut[gpByte] >> gpBit) & 1
+					if sBit == gBit {
+						match++
+					}
+				}
+
+				ratio := float64(match) / float64(N)
+				if ratio > 0.85 || ratio < 0.15 {
+					perfectCorrs++
+					inv := ""
+					if ratio < 0.5 {
+						inv = " (INVERTED)"
+					}
+					t.Logf("  GP[%d] bit %d ↔ Sbox bit %d: %.1f%% match%s",
+						gpByte, gpBit, sboxBit, ratio*100, inv)
+				}
+			}
+		}
+	}
+
+	if perfectCorrs > 0 {
+		t.Logf("\n🎉 Found %d significant bit-level correlations!", perfectCorrs)
+		t.Log("The S-box output IS present in the GP buffer, just scrambled/encoded.")
+	} else {
+		t.Log("\nNo strong bit correlations found in block 1.")
+		t.Log("The output encoding completely hides the S-box output at the bit level.")
+	}
+
+	// Compare with standard AES correlation as sanity check
+	t.Log("\n=== Sanity check: correlation of S-box output with standard AES CT ===")
+	for ctByte := 16; ctByte < 18; ctByte++ { // first 2 bytes of block 1
+		for sboxBit := 0; sboxBit < 8; sboxBit++ {
+			match := 0
+			for _, s := range samples {
+				sBit := (s.sboxOut >> sboxBit) & 1
+				cBit := (s.stdCT[ctByte] >> uint(sboxBit)) & 1
+				if sBit == cBit {
+					match++
+				}
+			}
+			ratio := float64(match) / float64(N)
+			if ratio > 0.85 || ratio < 0.15 {
+				t.Logf("  CT[%d] bit %d ↔ Sbox bit %d: %.1f%% match", ctByte, sboxBit, sboxBit, ratio*100)
+			}
+		}
+	}
+}
+
+func sqrt(x float64) float64 {
+	if x <= 0 {
+		return 0
+	}
+	z := x
+	for i := 0; i < 100; i++ {
+		z = z - (z*z-x)/(2*z)
+	}
+	return z
+}
+
+// TestDirectOutEncExtraction takes the brute-force approach: for block 1,
+// build a complete 16-byte → 16-byte lookup table by probing all 256 values
+// of each input byte independently and checking if the encoding is decomposable.
+//
+// If OutEnc(x) = L(x) XOR c for some GF(2) matrix L, then:
+//   OutEnc(a XOR b) = L(a) XOR L(b) XOR c = OutEnc(a) XOR OutEnc(b) XOR OutEnc(0)
+//
+// We test this GF(2)-linearity of the 16-byte → 16-byte OutEnc.
+func TestDirectOutEncExtraction(t *testing.T) {
+	t.Log("=== Testing if OutEnc (16→16 byte, per-block) is GF(2)-affine ===")
+
+	keyHex := "c251c048e6a027945e178067df8ae466"
+	key, _ := hex.DecodeString(keyHex)
+	cipher, _ := aes.NewCipher(key)
+
+	// Helper: compute OutEnc(stdCT) by finding the plaintext that produces stdCT,
+	// running it through WB-AES, and reading the GP output.
+	outEnc := func(targetCT [16]byte) [16]byte {
+		// AES_Decrypt(targetCT) gives us the plaintext for block 1
+		var pt [16]byte
+		cipher.Decrypt(pt[:], targetCT[:])
+
+		var pay [128]byte
+		copy(pay[16:32], pt[:])
+
+		gp, _ := runPhase1CaptureGP(pay)
+
+		var result [16]byte
+		copy(result[:], gp[16:32])
+		return result
+	}
+
+	// OutEnc(0) = the encoding of all-zero ciphertext
+	var zeroCT [16]byte
+	encZero := outEnc(zeroCT)
+	t.Logf("OutEnc(0x00...00) = %x", encZero)
+
+	// Test affine property: OutEnc(A XOR B) = OutEnc(A) XOR OutEnc(B) XOR OutEnc(0)
+	passCount := 0
+	failCount := 0
+
+	for trial := 0; trial < 32; trial++ {
+		// Create two random-ish ciphertexts
+		var ctA, ctB [16]byte
+		ctA[trial%16] = byte(trial + 1)
+		ctB[(trial+5)%16] = byte(trial + 0x80)
+
+		var ctC [16]byte // A XOR B
+		for j := 0; j < 16; j++ {
+			ctC[j] = ctA[j] ^ ctB[j]
+		}
+
+		encA := outEnc(ctA)
+		encB := outEnc(ctB)
+		encC := outEnc(ctC)
+
+		// Affine check: encA XOR encB XOR encC XOR encZero should == 0
+		var check [16]byte
+		for j := 0; j < 16; j++ {
+			check[j] = encA[j] ^ encB[j] ^ encC[j] ^ encZero[j]
+		}
+
+		isZero := true
+		for _, b := range check {
+			if b != 0 {
+				isZero = false
+				break
+			}
+		}
+
+		if isZero {
+			passCount++
+		} else {
+			failCount++
+			if failCount <= 3 {
+				t.Logf("  Trial %d: ❌ check=%x", trial, check)
+			}
+		}
+	}
+
+	t.Logf("\n=== OutEnc affine test: %d/32 pass, %d/32 fail ===", passCount, failCount)
+
+	if failCount == 0 {
+		t.Log("🎉🎉🎉 OutEnc IS GF(2)-AFFINE!")
+		t.Log("We can extract it as a 128×128 bit matrix + constant!")
+		t.Log("Phase 1 = crypto/aes.Encrypt + matrix multiply. ~30 lines of Go!")
+	} else {
+		t.Log("OutEnc is NOT GF(2)-affine.")
+		t.Log("It contains non-linear components (expected for Chow WB-AES: 4-bit S-box encodings)")
+	}
+
+	_ = binary.Size
+}

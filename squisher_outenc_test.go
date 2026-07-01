@@ -1,0 +1,145 @@
+//go:build withblob
+
+package squisher
+
+import (
+	"crypto/aes"
+	"encoding/hex"
+	"fmt"
+	"testing"
+)
+
+// TestOutEncPerByteViaAESInverse uses AES decryption to craft inputs
+// that produce SINGLE-BYTE ciphertext differences. If the output encoding
+// is per-byte, the GP output should also show single-byte differences.
+//
+// This is the correct way to probe OutEnc isolation. Previous tests
+// varied plaintext bytes, which caused ALL ciphertext bytes to change
+// (AES diffusion), making it impossible to distinguish per-byte from
+// cross-coupled OutEnc.
+func TestOutEncPerByteViaAESInverse(t *testing.T) {
+	t.Log("=== Probing OutEnc per-byte structure via AES inverse ===")
+
+	keyHex := "c251c048e6a027945e178067df8ae466"
+	key, _ := hex.DecodeString(keyHex)
+	block, _ := aes.NewCipher(key)
+
+	// Step 1: Get baseline GP output for all-zero input
+	var zeroPayload [128]byte
+	gpZero, _ := runPhase1CaptureGP(zeroPayload)
+	t.Logf("GP(zeros) block 7: %x", gpZero[112:128])
+
+	// Step 2: Compute standard AES of zeros (the base ciphertext)
+	var zeroPT [16]byte
+	var baseCT [16]byte
+	block.Encrypt(baseCT[:], zeroPT[:])
+	t.Logf("AES(zeros): %x", baseCT)
+
+	// Step 3: For each byte position i in [0,15], create a modified ciphertext
+	// that differs from baseCT in ONLY byte i. Then decrypt to get the plaintext
+	// that would produce that ciphertext. Feed that plaintext to WB-AES.
+	// If OutEnc is per-byte, only GP byte i should differ.
+
+	t.Log("\n--- Varying single ciphertext bytes via AES inverse ---")
+	t.Log("    If OutEnc is per-byte: only 1 GP byte should change")
+	t.Log("    If OutEnc is cross-coupled: multiple GP bytes will change")
+
+	for pos := 0; pos < 16; pos++ {
+		// Modify ciphertext at position pos
+		modCT := baseCT
+		modCT[pos] ^= 0x01 // flip one bit of one ciphertext byte
+
+		// Decrypt to find the plaintext that produces this ciphertext
+		var craftedPT [16]byte
+		block.Decrypt(craftedPT[:], modCT[:])
+
+		// Build a full 128-byte payload with the crafted plaintext in block 7 (payload[112:128])
+		var pay [128]byte
+		copy(pay[112:128], craftedPT[:])
+
+		// Run WB-AES and capture GP output
+		gpMod, _ := runPhase1CaptureGP(pay)
+
+		// Compare block 7 GP output (bytes 112-128)
+		changedBytes := 0
+		changedPositions := []int{}
+		for j := 0; j < 16; j++ {
+			if gpMod[112+j] != gpZero[112+j] {
+				changedBytes++
+				changedPositions = append(changedPositions, j)
+			}
+		}
+
+		indicator := "❌ CROSS-COUPLED"
+		if changedBytes == 1 && changedPositions[0] == pos {
+			indicator = "✅ PER-BYTE (same position!)"
+		} else if changedBytes == 1 {
+			indicator = fmt.Sprintf("🔶 PER-BYTE but PERMUTED (pos %d → %d)", pos, changedPositions[0])
+		} else if changedBytes <= 4 {
+			indicator = "🔶 SMALL GROUP"
+		}
+
+		t.Logf("  CT byte %2d changed → %2d GP bytes changed %s (at: %v)",
+			pos, changedBytes, indicator, changedPositions)
+	}
+
+	// Step 4: Also try varying ciphertext bytes by larger amounts
+	t.Log("\n--- Same test with XOR 0xFF (full byte flip) ---")
+	for pos := 0; pos < 16; pos++ {
+		modCT := baseCT
+		modCT[pos] ^= 0xFF
+
+		var craftedPT [16]byte
+		block.Decrypt(craftedPT[:], modCT[:])
+
+		var pay [128]byte
+		copy(pay[112:128], craftedPT[:])
+
+		gpMod, _ := runPhase1CaptureGP(pay)
+
+		changedBytes := 0
+		for j := 0; j < 16; j++ {
+			if gpMod[112+j] != gpZero[112+j] {
+				changedBytes++
+			}
+		}
+
+		t.Logf("  CT byte %2d (XOR 0xFF) → %2d GP bytes changed", pos, changedBytes)
+	}
+
+	// Step 5: If per-byte, extract the actual lookup tables
+	t.Log("\n--- If per-byte: extracting lookup tables for byte 0 of block 7 ---")
+
+	// Vary ONLY ciphertext byte 0 through all 256 values
+	lut := make(map[byte]byte) // stdCT[0] → gpOut[112]
+	for val := 0; val < 256; val++ {
+		modCT := baseCT
+		modCT[0] = byte(val)
+
+		var craftedPT [16]byte
+		block.Decrypt(craftedPT[:], modCT[:])
+
+		var pay [128]byte
+		copy(pay[112:128], craftedPT[:])
+
+		gpMod, _ := runPhase1CaptureGP(pay)
+
+		lut[byte(val)] = gpMod[112] // first byte of block 7 in GP output
+	}
+
+	// Check if it's a bijection
+	reverseMap := make(map[byte]bool)
+	for _, v := range lut {
+		reverseMap[v] = true
+	}
+
+	if len(reverseMap) == 256 {
+		t.Log("  ✅ LUT is a BIJECTION (256 unique output values)")
+		t.Log("  First 16 entries:")
+		for i := 0; i < 16; i++ {
+			t.Logf("    0x%02x → 0x%02x", i, lut[byte(i)])
+		}
+	} else {
+		t.Logf("  ❌ LUT is NOT a bijection (%d unique values)", len(reverseMap))
+	}
+}
