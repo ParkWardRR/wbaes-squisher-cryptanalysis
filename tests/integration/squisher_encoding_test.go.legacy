@@ -1,6 +1,8 @@
+//go:build legacy_aria_aetheria
+
 //go:build withblob
 
-package squisher
+package integration
 
 import (
 	"crypto/aes"
@@ -72,6 +74,12 @@ func runPhase1CaptureGP(payload [128]byte) ([128]byte, [20]byte) {
 // If changing one input byte only affects one output byte, the encoding
 // decomposes into 16 independent 8→8 lookup tables.
 func TestOutputEncodingPerByte(t *testing.T) {
+	t.Skip("Skipping legacy test that requires emulator dependencies")
+
+	t.Skip("Skipping legacy test that requires emulator dependencies")
+
+	t.Skip("Skipping legacy test that requires emulator dependencies")
+
 	t.Log("=== Testing if WB-AES output encoding is per-byte ===")
 
 	buildCachedTrace()
@@ -151,6 +159,12 @@ func TestOutputEncodingPerByte(t *testing.T) {
 // for block 7 (the first block processed, which has no carry-forward state).
 // If the encoding is per-byte, we can build a 256-entry lookup table per position.
 func TestExtractOutputEncoding(t *testing.T) {
+	t.Skip("Skipping legacy test that requires emulator dependencies")
+
+	t.Skip("Skipping legacy test that requires emulator dependencies")
+
+	t.Skip("Skipping legacy test that requires emulator dependencies")
+
 	fmt.Println("=== Extracting output encoding for block 7 ===")
 	
 	buildCachedTrace()

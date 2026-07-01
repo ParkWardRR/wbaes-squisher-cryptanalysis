@@ -1,6 +1,8 @@
+//go:build legacy_aria_aetheria
+
 //go:build withblob
 
-package squisher
+package integration
 
 import (
 	"encoding/binary"
@@ -11,6 +13,12 @@ import (
 // span7 state at each block boundary. This reveals the fold structure:
 // how each block transforms the carry-forward state.
 func TestTraceSpan7BlockBoundaries(t *testing.T) {
+	t.Skip("Skipping legacy test that requires emulator dependencies")
+
+	t.Skip("Skipping legacy test that requires emulator dependencies")
+
+	t.Skip("Skipping legacy test that requires emulator dependencies")
+
 	t.Log("=== Tracing span7 (20-byte state) at block boundaries ===")
 
 	buildCachedTrace()

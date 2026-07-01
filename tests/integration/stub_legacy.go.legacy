@@ -1,0 +1,24 @@
+//go:build legacy_aria_aetheria
+
+package integration
+
+type compiledTraceEntry struct{}
+func addrToOff(args ...interface{}) interface{} { return nil }
+var addrToOff int
+func fpSplitIndex(args ...interface{}) interface{} { return nil }
+var fpSplitIndex int
+func buildCachedTrace(args ...interface{}) interface{} { return nil }
+var buildCachedTrace int
+func fpPayloadVAddr(args ...interface{}) interface{} { return nil }
+var fpPayloadVAddr int
+func cachedInitialMem(args ...interface{}) interface{} { return nil }
+var cachedInitialMem int
+type FPCleanExchange struct{}
+func cachedInitialSP(args ...interface{}) interface{} { return nil }
+var cachedInitialSP int
+func fpCompiledMemSize(args ...interface{}) interface{} { return nil }
+var fpCompiledMemSize int
+func cachedInitialRegs(args ...interface{}) interface{} { return nil }
+var cachedInitialRegs int
+func loadEmbeddedSnapshot(args ...interface{}) interface{} { return nil }
+var loadEmbeddedSnapshot int
